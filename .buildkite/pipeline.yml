@@ -1,0 +1,8 @@
+steps:
+  - label: ":bats: Test"
+    key: test
+    command: ./auto/test
+
+  - label: ":lint-roller: Lint"
+    key: lint
+    command: ./auto/lint

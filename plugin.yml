@@ -1,0 +1,22 @@
+name: Bitwarden Secrets Manager
+description: Export secrets from a Bitwarden Secrets Manager project as environment variables
+author: https://github.com/nickburgin
+requirements:
+  - bash
+  - curl
+  - jq
+  - unzip
+configuration:
+  properties:
+    project-id:
+      type: string
+      description: "The Bitwarden Secrets Manager project that holds the secrets"
+    bws-version:
+      type: string
+      description: "The version of the bws CLI to download and cache"
+    dump-env:
+      type: boolean
+      description: "Print each exported name and value, for debugging only"
+  additionalProperties: false
+  required:
+    - project-id

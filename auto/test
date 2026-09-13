@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+set -euo pipefail
+
+# With no argument the image runs every file under tests/. With one or more
+# arguments, run bats against just those files.
+if (( $# > 0 )); then
+  docker compose run --rm --entrypoint bats tests "$@"
+else
+  docker compose run --rm tests
+fi

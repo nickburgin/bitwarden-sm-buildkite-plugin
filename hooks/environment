@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# Export Bitwarden Secrets Manager secrets that are scoped to this pipeline and
+# step.
+#
+# Bitwarden Secrets Manager holds a flat set of key/value pairs in one project,
+# so the scope lives in the key name rather than in a path:
+#
+#   <PIPELINE>__<VAR>              every step of that pipeline
+#   <PIPELINE>__<STEP_KEY>__<VAR>  only that step of that pipeline
+#
+# A pipeline slug and a step key normalise to upper case with each dash turned
+# into an underscore, so the pipeline my-app matches the key prefix MY_APP__.
+#
+# A step secret overrides a pipeline secret of the same variable name.
+
+set -euo pipefail
+
+basedir="$(dirname "$0")/.."
+
+# shellcheck source=lib/install-bws.bash
+. "${basedir}/lib/install-bws.bash"
+
+project_id="${BUILDKITE_PLUGIN_BITWARDEN_SM_PROJECT_ID:-}"
+dump_env="${BUILDKITE_PLUGIN_BITWARDEN_SM_DUMP_ENV:-false}"
+
+if [[ -z "${BWS_ACCESS_TOKEN:-}" ]]; then
+  echo "+++ :warning: BWS_ACCESS_TOKEN is not set" >&2
+  echo "Set it in the agent environment hook, so it never appears in a pipeline." >&2
+  exit 1
+fi
+
+if [[ -z "${project_id}" ]]; then
+  echo "+++ :warning: The plugin option project-id is not set" >&2
+  exit 1
+fi
+
+# Turn a pipeline slug or a step key into the form used inside a secret key.
+normalise() {
+  printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'
+}
+
+pipeline_segment="$(normalise "${BUILDKITE_PIPELINE_SLUG:-}")"
+step_segment="$(normalise "${BUILDKITE_STEP_KEY:-}")"
+
+if [[ -z "${pipeline_segment}" ]]; then
+  echo "+++ :warning: BUILDKITE_PIPELINE_SLUG is empty" >&2
+  exit 1
+fi
+
+echo "~~~ :bitwarden: Reading secrets for ${BUILDKITE_PIPELINE_SLUG}${BUILDKITE_STEP_KEY:+ (step ${BUILDKITE_STEP_KEY})}"
+
+# The plugin option wins over the environment default.
+BWS_VERSION="${BUILDKITE_PLUGIN_BITWARDEN_SM_BWS_VERSION:-${BWS_VERSION:-2.1.0}}"
+export BWS_VERSION
+
+if command -v bws >/dev/null 2>&1; then
+  bws_bin=bws
+elif ! bws_bin="$(install_bws)"; then
+  exit 1
+fi
+
+if ! secrets_json="$("${bws_bin}" secret list "${project_id}" --output json 2>&1)"; then
+  echo "+++ :warning: Failed to list secrets in project ${project_id}" >&2
+  echo "${secrets_json}" >&2
+  exit 1
+fi
+
+# jq emits one "NAME<TAB>value" line for each secret in scope, pipeline secrets
+# first, so a step secret of the same name overwrites the pipeline one.
+if ! matched="$(
+  printf '%s' "${secrets_json}" | jq -r \
+    --arg pipeline "${pipeline_segment}" \
+    --arg step "${step_segment}" '
+      [ .[]
+        | . as $secret
+        | ($secret.key | split("__")) as $parts
+        | if ($parts | length) == 2 and $parts[0] == $pipeline then
+            { scope: 0, name: $parts[1], value: $secret.value }
+          elif ($parts | length) == 3 and $parts[0] == $pipeline
+               and $step != "" and $parts[1] == $step then
+            { scope: 1, name: $parts[2], value: $secret.value }
+          else
+            empty
+          end
+      ]
+      | sort_by(.scope)
+      | .[]
+      | "\(.name)\t\(.value)"
+    ' 2>&1
+)"; then
+  echo "+++ :warning: Failed to parse the secret list" >&2
+  echo "${matched}" >&2
+  exit 1
+fi
+
+declare -A exported=()
+order=()
+
+while IFS=$'\t' read -r name value; do
+  [[ -n "${name}" ]] || continue
+
+  if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "Skipping ${name}, which is not a valid variable name" >&2
+    continue
+  fi
+
+  if [[ -z "${exported[${name}]+set}" ]]; then
+    order+=("${name}")
+  fi
+  exported["${name}"]="${value}"
+done <<< "${matched}"
+
+for name in "${order[@]}"; do
+  export "${name}=${exported[${name}]}"
+done
+
+# The agent redacts by name pattern, and the built-in patterns cover only names
+# such as *_TOKEN and *_PASSWORD. Name every injected variable, so a secret
+# called DEPLOY_URL is redacted too.
+if (( ${#order[@]} > 0 )); then
+  redacted="${BUILDKITE_REDACTED_VARS:-}"
+  for name in "${order[@]}"; do
+    redacted="${redacted:+${redacted},}${name}"
+  done
+  export BUILDKITE_REDACTED_VARS="${redacted}"
+  echo "Set BUILDKITE_REDACTED_VARS for ${#order[@]} secret(s)"
+fi
+
+if [[ "${dump_env}" =~ ^(true|1)$ ]]; then
+  for name in "${order[@]}"; do
+    echo "${name}=${exported[${name}]}"
+  done
+else
+  for name in "${order[@]}"; do
+    echo "Exported ${name}"
+  done
+fi
+
+echo "Exported ${#order[@]} secret(s)"

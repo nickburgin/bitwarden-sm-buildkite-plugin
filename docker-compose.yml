@@ -1,0 +1,18 @@
+services:
+  tests:
+    image: buildkite/plugin-tester:v4.3.0
+    volumes:
+      - ".:/plugin:z"
+
+  lint:
+    image: buildkite/plugin-linter
+    command: ['--id', 'nickburgin/bitwarden-sm']
+    volumes:
+      - ".:/plugin:z"
+
+  shellcheck:
+    image: koalaman/shellcheck:latest
+    command: -x hooks/environment
+    working_dir: /plugin
+    volumes:
+      - ".:/plugin:z"
