@@ -213,6 +213,83 @@ secret_list_json() {
   unstub bws
 }
 
+@test "finds its own lib when the agent sources it from a wrapper elsewhere" {
+  # The agent does not execute a hook. It writes a wrapper in a temporary
+  # directory and sources the hook from there, so $0 is the wrapper and only
+  # BASH_SOURCE[0] holds the real plugin path.
+  local wrapper_dir="${BATS_TEST_TMPDIR}/buildkite-agent-hook-wrapper"
+  mkdir -p "${wrapper_dir}"
+  cat > "${wrapper_dir}/wrapper" <<WRAPPER
+#!/bin/bash
+. "$PWD/hooks/environment"
+WRAPPER
+  chmod +x "${wrapper_dir}/wrapper"
+
+  stub bws \
+    "secret list proj-1234 --output json : echo '$(secret_list_json MY_APP__SOURCED yes)'"
+
+  run "${wrapper_dir}/wrapper"
+
+  assert_success
+  refute_output --partial "No such file or directory"
+  assert_output --partial "SOURCED=yes"
+
+  unstub bws
+}
+
+@test "does not leak its shell options into the agent shell" {
+  # The agent sources the hook into a shell that does not use -e or -u, and
+  # keeps using that shell for later hooks and the command. Leaking -u kills
+  # the job at the next read of an unset variable.
+  local wrapper_dir="${BATS_TEST_TMPDIR}/wrapper"
+  mkdir -p "${wrapper_dir}"
+  cat > "${wrapper_dir}/wrapper" <<WRAPPER
+#!/bin/bash
+. "$PWD/hooks/environment" >/dev/null 2>&1
+echo "opts=\$-"
+echo "unset var reads as [\${SOME_UNSET_VAR}]"
+echo "exported A=[\${A:-MISSING}]"
+echo "normalise leaked: \$(type -t __bitwarden_sm_normalise || echo no)"
+echo "install_bws leaked: \$(type -t install_bws || echo no)"
+echo "the agent shell survived"
+WRAPPER
+  chmod +x "${wrapper_dir}/wrapper"
+
+  stub bws \
+    "secret list proj-1234 --output json : echo '$(secret_list_json MY_APP__A 1)'"
+
+  run "${wrapper_dir}/wrapper"
+
+  assert_success
+  assert_output --partial "the agent shell survived"
+  refute_output --partial "unbound variable"
+  # The exports are the point of the hook, so they must outlive the function.
+  assert_output --partial "exported A=[1]"
+  assert_output --partial "normalise leaked: no"
+  assert_output --partial "install_bws leaked: no"
+
+  unstub bws
+}
+
+@test "fails the job when a guard fails and the agent sources it" {
+  unset BWS_ACCESS_TOKEN
+
+  local wrapper_dir="${BATS_TEST_TMPDIR}/wrapper"
+  mkdir -p "${wrapper_dir}"
+  cat > "${wrapper_dir}/wrapper" <<WRAPPER
+#!/bin/bash
+. "$PWD/hooks/environment"
+echo "the wrapper kept going"
+WRAPPER
+  chmod +x "${wrapper_dir}/wrapper"
+
+  run "${wrapper_dir}/wrapper"
+
+  assert_failure
+  assert_output --partial "BWS_ACCESS_TOKEN"
+  refute_output --partial "the wrapper kept going"
+}
+
 @test "installs bws when it is not on PATH" {
   export BWS_CACHE_DIR="${BATS_TEST_TMPDIR}/cache"
   mkdir -p "${BWS_CACHE_DIR}/bws-2.1.0"

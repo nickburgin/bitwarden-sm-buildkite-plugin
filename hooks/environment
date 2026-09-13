@@ -13,128 +13,168 @@
 # into an underscore, so the pipeline my-app matches the key prefix MY_APP__.
 #
 # A step secret overrides a pipeline secret of the same variable name.
+#
+# The agent sources this hook into a shell it keeps using for the later hooks
+# and for the command, so the whole body runs inside a function. That keeps the
+# helpers and the working variables local, and it lets the hook restore the
+# caller's shell options before it returns. A leaked -u ends the job at the next
+# read of an unset variable, which the agent reports as an unrelated failure.
 
-set -euo pipefail
+__bitwarden_sm_environment_hook() {
+  local hook_path basedir project_id dump_env
+  local pipeline_segment step_segment bws_bin secrets_json matched
+  local name value redacted
 
-basedir="$(dirname "$0")/.."
+  # The agent sources the hook from a wrapper in a temporary directory, so $0
+  # names the wrapper. BASH_SOURCE[0] still names this file.
+  hook_path="${BASH_SOURCE[0]:-$0}"
+  basedir="$(dirname "${hook_path}")/.."
 
-# shellcheck source=lib/install-bws.bash
-. "${basedir}/lib/install-bws.bash"
+  # shellcheck source=lib/install-bws.bash
+  . "${basedir}/lib/install-bws.bash"
 
-project_id="${BUILDKITE_PLUGIN_BITWARDEN_SM_PROJECT_ID:-}"
-dump_env="${BUILDKITE_PLUGIN_BITWARDEN_SM_DUMP_ENV:-false}"
+  project_id="${BUILDKITE_PLUGIN_BITWARDEN_SM_PROJECT_ID:-}"
+  dump_env="${BUILDKITE_PLUGIN_BITWARDEN_SM_DUMP_ENV:-false}"
 
-if [[ -z "${BWS_ACCESS_TOKEN:-}" ]]; then
-  echo "+++ :warning: BWS_ACCESS_TOKEN is not set" >&2
-  echo "Set it in the agent environment hook, so it never appears in a pipeline." >&2
-  exit 1
-fi
+  if [[ -z "${BWS_ACCESS_TOKEN:-}" ]]; then
+    echo "+++ :warning: BWS_ACCESS_TOKEN is not set" >&2
+    echo "Set it in the agent environment, so no pipeline can read it." >&2
+    return 1
+  fi
 
-if [[ -z "${project_id}" ]]; then
-  echo "+++ :warning: The plugin option project-id is not set" >&2
-  exit 1
-fi
+  if [[ -z "${project_id}" ]]; then
+    echo "+++ :warning: The plugin option project-id is not set" >&2
+    return 1
+  fi
+
+  pipeline_segment="$(__bitwarden_sm_normalise "${BUILDKITE_PIPELINE_SLUG:-}")"
+  step_segment="$(__bitwarden_sm_normalise "${BUILDKITE_STEP_KEY:-}")"
+
+  if [[ -z "${pipeline_segment}" ]]; then
+    echo "+++ :warning: BUILDKITE_PIPELINE_SLUG is empty" >&2
+    return 1
+  fi
+
+  echo "~~~ :bitwarden: Reading secrets for ${BUILDKITE_PIPELINE_SLUG}${BUILDKITE_STEP_KEY:+ (step ${BUILDKITE_STEP_KEY})}"
+
+  # The plugin option wins over the environment default.
+  BWS_VERSION="${BUILDKITE_PLUGIN_BITWARDEN_SM_BWS_VERSION:-${BWS_VERSION:-2.1.0}}"
+  export BWS_VERSION
+
+  if command -v bws >/dev/null 2>&1; then
+    bws_bin=bws
+  elif ! bws_bin="$(install_bws)"; then
+    return 1
+  fi
+
+  if ! secrets_json="$("${bws_bin}" secret list "${project_id}" --output json 2>&1)"; then
+    echo "+++ :warning: Failed to list secrets in project ${project_id}" >&2
+    echo "${secrets_json}" >&2
+    return 1
+  fi
+
+  # jq emits one "NAME<TAB>value" line for each secret in scope, pipeline
+  # secrets first, so a step secret of the same name overwrites the pipeline
+  # one.
+  if ! matched="$(
+    printf '%s' "${secrets_json}" | jq -r \
+      --arg pipeline "${pipeline_segment}" \
+      --arg step "${step_segment}" '
+        [ .[]
+          | . as $secret
+          | ($secret.key | split("__")) as $parts
+          | if ($parts | length) == 2 and $parts[0] == $pipeline then
+              { scope: 0, name: $parts[1], value: $secret.value }
+            elif ($parts | length) == 3 and $parts[0] == $pipeline
+                 and $step != "" and $parts[1] == $step then
+              { scope: 1, name: $parts[2], value: $secret.value }
+            else
+              empty
+            end
+        ]
+        | sort_by(.scope)
+        | .[]
+        | "\(.name)\t\(.value)"
+      ' 2>&1
+  )"; then
+    echo "+++ :warning: Failed to parse the secret list" >&2
+    echo "${matched}" >&2
+    return 1
+  fi
+
+  local -A exported=()
+  local -a order=()
+
+  while IFS=$'\t' read -r name value; do
+    [[ -n "${name}" ]] || continue
+
+    if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "Skipping ${name}, which is not a valid variable name" >&2
+      continue
+    fi
+
+    if [[ -z "${exported[${name}]+set}" ]]; then
+      order+=("${name}")
+    fi
+    exported["${name}"]="${value}"
+  done <<< "${matched}"
+
+  for name in "${order[@]}"; do
+    export "${name}=${exported[${name}]}"
+  done
+
+  # The agent redacts by name pattern, and the built-in patterns cover only
+  # names such as *_TOKEN and *_PASSWORD. Name every injected variable, so a
+  # secret called DEPLOY_URL is redacted too.
+  if (( ${#order[@]} > 0 )); then
+    redacted="${BUILDKITE_REDACTED_VARS:-}"
+    for name in "${order[@]}"; do
+      redacted="${redacted:+${redacted},}${name}"
+    done
+    export BUILDKITE_REDACTED_VARS="${redacted}"
+    echo "Set BUILDKITE_REDACTED_VARS for ${#order[@]} secret(s)"
+  fi
+
+  if [[ "${dump_env}" =~ ^(true|1)$ ]]; then
+    for name in "${order[@]}"; do
+      echo "${name}=${exported[${name}]}"
+    done
+  else
+    for name in "${order[@]}"; do
+      echo "Exported ${name}"
+    done
+  fi
+
+  echo "Exported ${#order[@]} secret(s)"
+}
 
 # Turn a pipeline slug or a step key into the form used inside a secret key.
-normalise() {
+__bitwarden_sm_normalise() {
   printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'
 }
 
-pipeline_segment="$(normalise "${BUILDKITE_PIPELINE_SLUG:-}")"
-step_segment="$(normalise "${BUILDKITE_STEP_KEY:-}")"
+# Save the caller's shell options, run the hook under strict options, then put
+# the caller's options back whether the hook passed or failed.
+__bitwarden_sm_saved_opts="$(set +o)"
+set -euo pipefail
 
-if [[ -z "${pipeline_segment}" ]]; then
-  echo "+++ :warning: BUILDKITE_PIPELINE_SLUG is empty" >&2
-  exit 1
-fi
-
-echo "~~~ :bitwarden: Reading secrets for ${BUILDKITE_PIPELINE_SLUG}${BUILDKITE_STEP_KEY:+ (step ${BUILDKITE_STEP_KEY})}"
-
-# The plugin option wins over the environment default.
-BWS_VERSION="${BUILDKITE_PLUGIN_BITWARDEN_SM_BWS_VERSION:-${BWS_VERSION:-2.1.0}}"
-export BWS_VERSION
-
-if command -v bws >/dev/null 2>&1; then
-  bws_bin=bws
-elif ! bws_bin="$(install_bws)"; then
-  exit 1
-fi
-
-if ! secrets_json="$("${bws_bin}" secret list "${project_id}" --output json 2>&1)"; then
-  echo "+++ :warning: Failed to list secrets in project ${project_id}" >&2
-  echo "${secrets_json}" >&2
-  exit 1
-fi
-
-# jq emits one "NAME<TAB>value" line for each secret in scope, pipeline secrets
-# first, so a step secret of the same name overwrites the pipeline one.
-if ! matched="$(
-  printf '%s' "${secrets_json}" | jq -r \
-    --arg pipeline "${pipeline_segment}" \
-    --arg step "${step_segment}" '
-      [ .[]
-        | . as $secret
-        | ($secret.key | split("__")) as $parts
-        | if ($parts | length) == 2 and $parts[0] == $pipeline then
-            { scope: 0, name: $parts[1], value: $secret.value }
-          elif ($parts | length) == 3 and $parts[0] == $pipeline
-               and $step != "" and $parts[1] == $step then
-            { scope: 1, name: $parts[2], value: $secret.value }
-          else
-            empty
-          end
-      ]
-      | sort_by(.scope)
-      | .[]
-      | "\(.name)\t\(.value)"
-    ' 2>&1
-)"; then
-  echo "+++ :warning: Failed to parse the secret list" >&2
-  echo "${matched}" >&2
-  exit 1
-fi
-
-declare -A exported=()
-order=()
-
-while IFS=$'\t' read -r name value; do
-  [[ -n "${name}" ]] || continue
-
-  if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-    echo "Skipping ${name}, which is not a valid variable name" >&2
-    continue
-  fi
-
-  if [[ -z "${exported[${name}]+set}" ]]; then
-    order+=("${name}")
-  fi
-  exported["${name}"]="${value}"
-done <<< "${matched}"
-
-for name in "${order[@]}"; do
-  export "${name}=${exported[${name}]}"
-done
-
-# The agent redacts by name pattern, and the built-in patterns cover only names
-# such as *_TOKEN and *_PASSWORD. Name every injected variable, so a secret
-# called DEPLOY_URL is redacted too.
-if (( ${#order[@]} > 0 )); then
-  redacted="${BUILDKITE_REDACTED_VARS:-}"
-  for name in "${order[@]}"; do
-    redacted="${redacted:+${redacted},}${name}"
-  done
-  export BUILDKITE_REDACTED_VARS="${redacted}"
-  echo "Set BUILDKITE_REDACTED_VARS for ${#order[@]} secret(s)"
-fi
-
-if [[ "${dump_env}" =~ ^(true|1)$ ]]; then
-  for name in "${order[@]}"; do
-    echo "${name}=${exported[${name}]}"
-  done
+if __bitwarden_sm_environment_hook; then
+  __bitwarden_sm_status=0
 else
-  for name in "${order[@]}"; do
-    echo "Exported ${name}"
-  done
+  __bitwarden_sm_status=$?
 fi
 
-echo "Exported ${#order[@]} secret(s)"
+eval "${__bitwarden_sm_saved_opts}"
+
+# install_bws comes from the sourced lib, so it needs removing here too.
+unset -f __bitwarden_sm_environment_hook __bitwarden_sm_normalise install_bws
+unset __bitwarden_sm_saved_opts
+
+# Exit on a failure, whether the agent sourced this hook or ran it. A `return`
+# would only leave the source and let the job carry on with no secrets, which
+# fails later and in a place that does not name this hook.
+if (( __bitwarden_sm_status != 0 )); then
+  unset __bitwarden_sm_status
+  exit 1
+fi
+unset __bitwarden_sm_status
