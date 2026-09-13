@@ -22,7 +22,7 @@
 
 __bitwarden_sm_environment_hook() {
   local hook_path basedir project_id dump_env
-  local pipeline_segment step_segment bws_bin secrets_json matched
+  local pipeline_segment step_segment bws_bin secrets_json matched_file
   local name value redacted
 
   # The agent sources the hook from a wrapper in a temporary directory, so $0
@@ -73,11 +73,17 @@ __bitwarden_sm_environment_hook() {
     return 1
   fi
 
-  # jq emits one "NAME<TAB>value" line for each secret in scope, pipeline
-  # secrets first, so a step secret of the same name overwrites the pipeline
-  # one.
-  if ! matched="$(
-    printf '%s' "${secrets_json}" | jq -r \
+  # jq writes the name and the value as separate NUL-terminated records,
+  # pipeline secrets first, so a step secret of the same name overwrites the
+  # pipeline one. A newline or a tab separator would split a multi-line value
+  # such as a PGP key across records. NUL cannot appear in a shell variable, so
+  # no value can contain the separator.
+  # The file holds every secret in plain text, so mktemp creates it with mode
+  # 0600, and the trap removes it even when the hook exits early.
+  matched_file="$(mktemp "${TMPDIR:-/tmp}/bitwarden-sm.XXXXXXXXXX")"
+  trap 'rm -f "${matched_file}"' RETURN
+
+  if ! printf '%s' "${secrets_json}" | jq -j \
       --arg pipeline "${pipeline_segment}" \
       --arg step "${step_segment}" '
         [ .[]
@@ -94,22 +100,22 @@ __bitwarden_sm_environment_hook() {
         ]
         | sort_by(.scope)
         | .[]
-        | "\(.name)\t\(.value)"
-      ' 2>&1
-  )"; then
+        | .name, "\u0000", .value, "\u0000"
+      ' > "${matched_file}" 2>/dev/null; then
     echo "+++ :warning: Failed to parse the secret list" >&2
-    echo "${matched}" >&2
     return 1
   fi
 
   local -A exported=()
   local -a order=()
 
-  while IFS=$'\t' read -r name value; do
+  while IFS= read -r -d '' name && IFS= read -r -d '' value; do
     [[ -n "${name}" ]] || continue
 
     if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      echo "Skipping ${name}, which is not a valid variable name" >&2
+      # Never print the name. An invalid name means the record is not what the
+      # plugin expects, and the material may be part of a secret value.
+      echo "Skipping a secret whose name is not a valid variable name" >&2
       continue
     fi
 
@@ -117,7 +123,7 @@ __bitwarden_sm_environment_hook() {
       order+=("${name}")
     fi
     exported["${name}"]="${value}"
-  done <<< "${matched}"
+  done < "${matched_file}"
 
   for name in "${order[@]}"; do
     export "${name}=${exported[${name}]}"

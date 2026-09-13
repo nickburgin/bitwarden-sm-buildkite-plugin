@@ -84,11 +84,22 @@ The agent image needs no change.
 
 Set `BWS_CACHE_DIR` to move the cache.
 
+## Multi-line values
+
+A value keeps its newlines, so a PGP key or an SSH key exports whole:
+
+```bash
+echo "$GPG_KEY" | gpg --import
+```
+
 ## Log redaction
 
 The agent redacts a value by variable name, and the built-in patterns cover only
 names such as `*_TOKEN` and `*_PASSWORD`. The plugin adds every name it exports
 to `BUILDKITE_REDACTED_VARS`, so a secret named `DEPLOY_URL` is redacted too.
+
+The plugin prints a name, never a value. Turn on `dump-env` only to debug,
+because it prints every value to the build log.
 
 ## Requirements
 

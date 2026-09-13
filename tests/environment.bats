@@ -153,6 +153,82 @@ secret_list_json() {
 }
 
 #-------
+# Multi-line values
+
+@test "keeps a multi-line value whole" {
+  local key='-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBGSECRET1\nlQOYBGSECRET2\n-----END PGP PRIVATE KEY BLOCK-----'
+
+  stub bws \
+    "secret list proj-1234 --output json : printf '%s\n' '[{\"id\":\"i\",\"key\":\"MY_APP__GPG_KEY\",\"value\":\"${key}\",\"note\":\"\"}]'"
+
+  # Source the hook, so the exported value is readable afterwards. A subshell
+  # would discard it.
+  export BUILDKITE_PLUGIN_BITWARDEN_SM_DUMP_ENV=false
+  run bash -c ". $PWD/hooks/environment >/dev/null && printf 'lines=%s first=%s last=%s' \
+    \"\$(printf '%s' \"\${GPG_KEY}\" | wc -l)\" \
+    \"\$(printf '%s' \"\${GPG_KEY}\" | head -1)\" \
+    \"\$(printf '%s' \"\${GPG_KEY}\" | tail -1)\""
+
+  assert_success
+  # Three newlines means four lines, so the value survived whole.
+  assert_output --partial "lines=3"
+  assert_output --partial "first=-----BEGIN PGP PRIVATE KEY BLOCK-----"
+  assert_output --partial "last=-----END PGP PRIVATE KEY BLOCK-----"
+
+  unstub bws
+}
+
+@test "never prints a line of a multi-line secret value" {
+  local key='-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBGSECRET1\nlQOYBGSECRET2\n-----END PGP PRIVATE KEY BLOCK-----'
+
+  stub bws \
+    "secret list proj-1234 --output json : printf '%s\n' '[{\"id\":\"i\",\"key\":\"MY_APP__GPG_KEY\",\"value\":\"${key}\",\"note\":\"\"}]'"
+
+  # dump-env is off by default in this test, so no value may reach the log.
+  export BUILDKITE_PLUGIN_BITWARDEN_SM_DUMP_ENV=false
+
+  run bash -c "$PWD/hooks/environment"
+
+  assert_success
+  refute_output --partial "lQOYBGSECRET1"
+  refute_output --partial "lQOYBGSECRET2"
+  refute_output --partial "PGP PRIVATE KEY BLOCK"
+  assert_output --partial "Exported GPG_KEY"
+
+  unstub bws
+}
+
+@test "leaves no temporary file holding the secrets" {
+  export TMPDIR="${BATS_TEST_TMPDIR}/tmp"
+  mkdir -p "${TMPDIR}"
+
+  stub bws \
+    "secret list proj-1234 --output json : echo '$(secret_list_json MY_APP__TOKEN s3cr3t-value)'"
+
+  run bash -c "$PWD/hooks/environment"
+
+  assert_success
+  # The hook writes the secrets to a temporary file, so nothing may remain.
+  run bash -c "grep -rl s3cr3t-value '${TMPDIR}' 2>/dev/null | wc -l"
+  assert_output "0"
+
+  unstub bws
+}
+
+@test "never prints secret material in a skip message" {
+  # An invalid name must not carry any of the value into the log.
+  stub bws \
+    "secret list proj-1234 --output json : echo '$(secret_list_json MY_APP__9BAD s3cr3t-value)'"
+
+  run bash -c "$PWD/hooks/environment"
+
+  assert_success
+  refute_output --partial "s3cr3t-value"
+
+  unstub bws
+}
+
+#-------
 # Redaction
 
 @test "adds every exported name to BUILDKITE_REDACTED_VARS" {
